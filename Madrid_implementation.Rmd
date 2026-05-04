@@ -1,0 +1,536 @@
+---
+title: "Madrid Air Quality — VDS2526 Implementation (Group 6)"
+author: "Group 6"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    fig_width: 9
+    fig_height: 5.5
+---
+
+# Setup
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(ggrepel)
+library(scales)
+library(viridis)
+library(patchwork)
+
+# Make ggplot output consistent
+theme_set(theme_minimal(base_size = 12))
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi = 150
+)
+```
+
+
+# Data Loading
+```{r}
+# 1. Read the stations file
+stations <- read_csv("data/stations.csv") %>%
+  mutate(id = as.character(id))
+
+# 2. Read all 18 yearly files into one long tibble
+years <- 2001:2018
+
+read_year <- function(yr) {
+  read_csv(
+    paste0("data/madrid_", yr, ".csv"),
+    show_col_types = FALSE,
+    progress = FALSE
+  ) %>%
+    mutate(station = as.character(station)) %>%
+    pivot_longer(
+      cols = -c(date, station),
+      names_to = "pollutant",
+      values_to = "value"
+    ) %>%
+    filter(!is.na(value))
+}
+
+raw <- map_dfr(years, read_year)
+
+# 3. Add date components
+raw <- raw %>%
+  mutate(
+    date  = as_datetime(date),
+    year  = year(date),
+    month = month(date)
+  )
+
+# 4. Keep only the five pollutants used in the report
+keep <- c("NO_2", "PM10", "CO", "SO_2", "O_3")
+data <- raw %>% filter(pollutant %in% keep)
+
+# 5. Join station metadata
+data <- data %>%
+  left_join(stations, by = c("station" = "id"))
+
+# 6. Sanity check
+cat("Rows:", nrow(data), "\n")
+cat("Years:", paste(range(data$year), collapse = "-"), "\n")
+cat("Stations:", n_distinct(data$station), "\n")
+cat("Pollutants:", paste(unique(data$pollutant), collapse = ", "), "\n")
+
+# 7. Cache to RDS so we don't re-read 480 MB every time
+saveRDS(data, "data_clean.rds")
+```
+# Visualisation 1 — Multi-line Trend (% change vs 2001)
+
+```{r}
+# Annual mean concentration per pollutant (city-wide average)
+yearly_mean <- data %>%
+  group_by(year, pollutant) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Compute the 2001 baseline for each pollutant
+baseline_2001 <- yearly_mean %>%
+  filter(year == 2001) %>%
+  select(pollutant, baseline = mean_value)
+
+# Percentage change relative to 2001
+trend_pct <- yearly_mean %>%
+  inner_join(baseline_2001, by = "pollutant") %>%
+  mutate(pct_change = (mean_value - baseline) / baseline * 100)
+
+# Tidy pollutant labels
+trend_pct$pollutant <- recode(trend_pct$pollutant,
+                              "NO_2" = "NO2",
+                              "SO_2" = "SO2",
+                              "O_3"  = "O3")
+
+# Build the plot
+p1 <- ggplot(trend_pct, aes(x = year, y = pct_change, colour = pollutant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.2) +
+  scale_x_continuous(breaks = seq(2001, 2018, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title    = "Annual mean pollutant concentrations, % change vs 2001",
+    subtitle = "Madrid, 2001-2018 (city-wide average across monitoring stations)",
+    x        = "Year",
+    y        = "Change vs 2001 baseline",
+    colour   = "Pollutant"
+  ) +
+  theme(legend.position = "bottom")
+
+# Save the figure
+ggsave("figures/01_trend_pct_change.png",
+       plot = p1, width = 10, height = 6, dpi = 300)
+
+p1
+```
+# Visualisation 2 — Geographic Bubble Map (2018)
+
+```{r}
+# Aggregate 2018 mean per station for NO_2 and PM10
+station_2018 <- data %>%
+  filter(year == 2018, pollutant %in% c("NO_2", "PM10")) %>%
+  group_by(station, pollutant, name, lon, lat) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Drop stations with no coordinates and pivot to wide format
+station_wide <- station_2018 %>%
+  filter(!is.na(lon)) %>%
+  pivot_wider(names_from = pollutant, values_from = mean_value) %>%
+  filter(!is.na(NO_2), !is.na(PM10))
+
+cat("Stations on map:", nrow(station_wide), "\n")
+
+# Plot bubbles: size = NO2, colour = PM10
+p2 <- ggplot(station_wide, aes(x = lon, y = lat)) +
+  geom_point(aes(size = NO_2, colour = PM10), alpha = 0.85) +
+  scale_size_continuous(
+    name  = "Mean NO2\n(ug/m3)",
+    range = c(3, 14)
+  ) +
+  scale_colour_viridis_c(
+    name   = "Mean PM10\n(ug/m3)",
+    option = "plasma"
+  ) +
+  geom_text_repel(
+    aes(label = name),
+    size = 3,
+    max.overlaps = 25,
+    box.padding = 0.4,
+    min.segment.length = 0
+  ) +
+  coord_quickmap() +
+  labs(
+    title    = "Spatial distribution of NO2 and PM10 across Madrid (2018)",
+    subtitle = "Bubble size encodes NO2; colour encodes PM10",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(legend.position = "right")
+
+ggsave("figures/02_bubble_map_2018.png",
+       plot = p2, width = 11, height = 7.5, dpi = 300)
+
+p2
+```
+
+# Visualisation 3 — Diverging Bar Chart (NO2 change 2008 to 2018)
+
+```{r viz3-diverging}
+# Per-station mean NO2 in 2008 and 2018
+station_change <- data %>%
+  filter(pollutant == "NO_2", year %in% c(2008, 2018)) %>%
+  group_by(station, name, year) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = year, values_from = mean_value, names_prefix = "y") %>%
+  filter(!is.na(y2008), !is.na(y2018), !is.na(name)) %>%
+  mutate(
+    change    = y2018 - y2008,
+    direction = ifelse(change > 0, "Worsened", "Improved")
+  ) %>%
+  arrange(change) %>%
+  mutate(name = factor(name, levels = name))
+
+cat("Stations with NO2 in both 2008 and 2018:", nrow(station_change), "\n")
+
+# Plot
+p3 <- ggplot(station_change, aes(x = change, y = name)) +
+  geom_col(aes(fill = direction), width = 0.75) +
+  geom_vline(xintercept = 0, colour = "grey30", linewidth = 0.4) +
+  geom_text(data = filter(station_change, change >= 0),
+            aes(label = sprintf("2018: %.0f", y2018)),
+            hjust = -0.15, size = 3, colour = "grey20") +
+  geom_text(data = filter(station_change, change < 0),
+            aes(label = sprintf("2018: %.0f", y2018)),
+            hjust = 1.15, size = 3, colour = "grey20") +
+  scale_fill_manual(
+    values = c("Improved" = "#2c7fb8", "Worsened" = "#d7301f"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Change in mean NO2 per station, 2008 to 2018",
+    subtitle = "Labels show absolute 2018 level (ug/m3). EU annual limit = 40 ug/m3.",
+    x = "Change in mean NO2 (ug/m3)",
+    y = NULL
+  ) +
+  expand_limits(x = c(min(station_change$change) - 8,
+                      max(station_change$change) + 12)) +
+  theme(legend.position = "bottom")
+
+ggsave("figures/03_diverging_change.png",
+       plot = p3, width = 10, height = 7, dpi = 300)
+
+p3
+```
+
+# Visualisation 4 — Seasonal Heatmap (NO2 month × year)
+
+```{r viz4-heatmap}
+# Mean monthly NO2 across all monitoring stations
+heatmap_data <- data %>%
+  filter(pollutant == "NO_2") %>%
+  group_by(year, month) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(month_label = factor(month.abb[month], levels = rev(month.abb)))
+
+# Plot
+p4 <- ggplot(heatmap_data, aes(x = year, y = month_label, fill = mean_value)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(
+    name    = "Mean NO2\n(ug/m3)",
+    option  = "viridis"
+  ) +
+  scale_x_continuous(breaks = seq(2001, 2018, 1), expand = c(0, 0)) +
+  labs(
+    title    = "Monthly mean NO2 in Madrid, 2001-2018",
+    subtitle = "Colour encodes mean NO2 (viridis palette, colour-blind safe)",
+    x = "Year",
+    y = "Month"
+  ) +
+  theme(
+    panel.grid  = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("figures/04_seasonal_heatmap.png",
+       plot = p4, width = 12, height = 6, dpi = 300)
+
+p4
+```
+
+# Visualisation 5 — Slope Graph (Pollutant Profile 2001 vs 2018)
+
+```{r viz5-slope}
+# Mean per pollutant in 2001 and 2018
+slope_data <- data %>%
+  filter(year %in% c(2001, 2018)) %>%
+  group_by(year, pollutant) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Lookup of direction (improved vs worsened)
+direction_lookup <- slope_data %>%
+  pivot_wider(names_from = year, values_from = mean_value, names_prefix = "y") %>%
+  mutate(direction = ifelse(y2018 > y2001, "Worsened", "Improved")) %>%
+  select(pollutant, direction)
+
+# Percentage of 2001 baseline + tidy labels
+slope_pct <- slope_data %>%
+  group_by(pollutant) %>%
+  mutate(pct = mean_value / mean_value[year == 2001] * 100) %>%
+  ungroup() %>%
+  left_join(direction_lookup, by = "pollutant") %>%
+  mutate(pollutant = recode(pollutant,
+                            "NO_2" = "NO2",
+                            "SO_2" = "SO2",
+                            "O_3"  = "O3"))
+# Slope graph
+p5 <- ggplot(slope_pct,
+             aes(x = factor(year), y = pct, group = pollutant, colour = direction)) +
+  geom_hline(yintercept = 100, linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    data = filter(slope_pct, year == 2018),
+    aes(label = paste0(pollutant, ": ", round(pct), "%")),
+    nudge_x        = 0.15,
+    hjust          = 0,
+    size           = 3.8,
+    fontface       = "bold",
+    direction      = "y",
+    segment.colour = "grey70",
+    segment.size   = 0.3,
+    box.padding    = 0.4,
+    show.legend    = FALSE
+  ) +
+  annotate("text",
+           x = 1, y = 108,
+           label = "2001 baseline (100%)",
+           colour = "grey30",
+           size = 3.3,
+           fontface = "italic",
+           hjust = 0.5) +
+  scale_colour_manual(
+    values = c("Improved" = "#2c7fb8", "Worsened" = "#d7301f"),
+    name   = NULL
+  ) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  expand_limits(x = c(0.4, 2.6)) +
+  labs(
+    title    = "Pollutant profile: 2001 versus 2018",
+    subtitle = "Each line shows mean concentration as a percentage of the 2001 baseline",
+    x = NULL,
+    y = "Percentage of 2001 baseline"
+  ) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank())
+
+ggsave("figures/05_slope_graph.png",
+       plot = p5, width = 10, height = 6, dpi = 300)
+
+p5
+```
+
+# Visualisation 6 — Small Multiples per Pollutant (GH1)
+
+```{r viz6-small-multiples}
+# Annual mean per pollutant (city-wide)
+sm_data <- data %>%
+  filter(pollutant %in% c("NO_2", "PM10", "SO_2", "CO", "O_3")) %>%
+  group_by(year, pollutant) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(pollutant = recode(pollutant,
+                            "NO_2" = "NO2",
+                            "SO_2" = "SO2",
+                            "O_3"  = "O3"),
+         pollutant = factor(pollutant,
+                            levels = c("NO2", "PM10", "SO2", "CO", "O3")))
+
+# Small multiples plot
+p6 <- ggplot(sm_data, aes(x = year, y = mean_value)) +
+  geom_area(fill = "#a6cee3", alpha = 0.5) +
+  geom_line(linewidth = 1, colour = "#1f78b4") +
+  geom_point(size = 1.6, colour = "#1f78b4") +
+  facet_wrap(~ pollutant, scales = "free_y", ncol = 3) +
+  scale_x_continuous(breaks = seq(2001, 2018, 4)) +
+  labs(
+    title    = "Annual mean concentration per pollutant, 2001-2018",
+    subtitle = "Each panel uses its own y-axis range, so each trend can be read clearly",
+    x = "Year",
+    y = "Mean annual concentration (ug/m3, except CO in mg/m3)"
+  ) +
+  theme(strip.text     = element_text(face = "bold", size = 11),
+        panel.spacing  = unit(1, "lines"),
+        panel.grid.minor = element_blank())
+
+ggsave("figures/06_small_multiples.png",
+       plot = p6, width = 11, height = 6, dpi = 300)
+
+p6
+```
+
+# Visualisation 7 — Parallel Coordinates per Station (GH2)
+
+```{r viz7-parallel}
+# 2018 mean per station across three pollutants
+station_pc <- data %>%
+  filter(year == 2018, pollutant %in% c("NO_2", "PM10", "O_3")) %>%
+  group_by(station, name, pollutant) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(name))
+
+# Keep only stations that measured all three pollutants
+station_wide <- station_pc %>%
+  pivot_wider(names_from = pollutant, values_from = mean_value) %>%
+  filter(complete.cases(.))
+
+cat("Stations with all 3 pollutants in 2018:", nrow(station_wide), "\n")
+
+# Back to long format and normalise each pollutant to [0, 1]
+station_long <- station_wide %>%
+  pivot_longer(c(NO_2, PM10, O_3),
+               names_to = "pollutant", values_to = "value") %>%
+  mutate(pollutant = recode(pollutant,
+                            "NO_2" = "NO2",
+                            "O_3"  = "O3"),
+         pollutant = factor(pollutant, levels = c("NO2", "PM10", "O3"))) %>%
+  group_by(pollutant) %>%
+  mutate(norm = (value - min(value)) / (max(value) - min(value))) %>%
+  ungroup()
+
+# Highlight four anchor stations
+highlight <- c("Plaza Castilla", "Casa de Campo",
+               "Pza. Fernández Ladreda", "Escuelas Aguirre")
+
+station_long <- station_long %>%
+  mutate(highlighted = ifelse(name %in% highlight, name, "Other"))
+
+# Plot
+p7 <- ggplot(station_long, aes(x = pollutant, y = norm, group = name)) +
+  geom_line(data = filter(station_long, highlighted == "Other"),
+            colour = "grey75", linewidth = 0.5, alpha = 0.7) +
+  geom_line(data = filter(station_long, highlighted != "Other"),
+            aes(colour = highlighted), linewidth = 1.3) +
+  geom_point(data = filter(station_long, highlighted != "Other"),
+             aes(colour = highlighted), size = 2.8) +
+  scale_colour_brewer(palette = "Set1", name = "Highlighted stations") +
+  scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  labs(
+    title    = "Parallel coordinates: monitoring station profiles in 2018",
+    subtitle = "Each line is one station; values normalised to [0, 1] per pollutant axis",
+    x = "Pollutant",
+    y = "Normalised value (0 = city minimum, 1 = city maximum)"
+  ) +
+  theme(legend.position  = "right",
+        panel.grid.minor = element_blank())
+
+ggsave("figures/07_parallel_coords.png",
+       plot = p7, width = 11, height = 6, dpi = 300)
+
+p7
+```
+
+# Visualisation 8 — Radar Chart (Pollutant Profile 2001 vs 2018)
+```{r viz8-radar}
+library(fmsb)
+
+# Mean per pollutant in 2001 and 2018, expressed as % of 2001 baseline
+radar_data <- data %>%
+  filter(year %in% c(2001, 2018),
+         pollutant %in% c("NO_2", "PM10", "SO_2", "CO", "O_3")) %>%
+  group_by(year, pollutant) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(pollutant) %>%
+  mutate(pct = mean_value / mean_value[year == 2001] * 100) %>%
+  ungroup() %>%
+  mutate(pollutant = recode(pollutant,
+                            "NO_2" = "NO2",
+                            "SO_2" = "SO2",
+                            "O_3"  = "O3"))
+
+# Pivot to wide form so each row is one year, columns are pollutants
+radar_wide <- radar_data %>%
+  select(year, pollutant, pct) %>%
+  pivot_wider(names_from = pollutant, values_from = pct) %>%
+  select(year, NO2, PM10, O3, SO2, CO)
+
+# fmsb requires the first two rows to be axis maximum and minimum
+radar_mat <- rbind(
+  rep(160, 5),
+  rep(0,   5),
+  as.data.frame(radar_wide[, -1])
+)
+rownames(radar_mat) <- c("max", "min", "2001", "2018")
+
+# Save to PNG (fmsb is base graphics, not ggplot)
+png("figures/08_radar.png", width = 8, height = 8, units = "in", res = 300)
+par(mar = c(3, 2, 4, 2))
+radarchart(
+  radar_mat,
+  axistype    = 1,
+  pcol        = c("#1f78b4", "#33a02c"),
+  pfcol       = c(adjustcolor("#1f78b4", 0.25),
+                  adjustcolor("#33a02c", 0.25)),
+  plwd        = 2.5,
+  plty        = 1,
+  cglcol      = "grey80",
+  cglty       = 1,
+  cglwd       = 0.8,
+  axislabcol  = "grey50",
+  caxislabels = c("0%", "40%", "80%", "120%", "160%"),
+  vlcex       = 1.1,
+  title       = "Pollutant profile: 2001 vs 2018 (radar view)"
+)
+legend("bottom",
+       legend = c("2001", "2018"),
+       col    = c("#1f78b4", "#33a02c"),
+       lwd    = 2,
+       bty    = "n",
+       horiz  = TRUE,
+       cex    = 1)
+dev.off()
+
+# Display the saved PNG inline in the report
+knitr::include_graphics("figures/08_radar.png")
+```
+
+
+
+# Visualisation 9 — Comprehensive Dashboard
+```{r viz9-dashboard, fig.width=16, fig.height=22}
+library(patchwork)
+library(png)
+library(grid)
+
+# The radar chart (Visualisation 8) was rendered with fmsb directly to PNG,
+# so we read it back in and wrap it as a ggplot-compatible panel.
+radar_img <- readPNG("figures/08_radar.png")
+p8_panel <- ggplot() +
+  annotation_custom(rasterGrob(radar_img, interpolate = TRUE)) +
+  theme_void()
+
+# Compose the dashboard (4 rows by 2 columns)
+dashboard <- (p1 | p5) /
+             (p6 | p8_panel) /
+             (p2 | p7) /
+             (p3 | p4) +
+  plot_annotation(
+    title    = "Madrid Air Quality 2001-2018 - Comprehensive Dashboard",
+    subtitle = "Group 6 - VDS2526 Implementation Report",
+    theme    = theme(plot.title    = element_text(size = 18, face = "bold"),
+                     plot.subtitle = element_text(size = 12, colour = "grey40"))
+  )
+
+ggsave("figures/09_dashboard_composite.png",
+       plot  = dashboard,
+       width = 16, height = 22, dpi = 150)
+
+dashboard
+```
